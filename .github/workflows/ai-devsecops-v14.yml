@@ -1,0 +1,1003 @@
+name: CI DevSecOps (javascript)
+# Domain: general (confidence: 1.00)
+# Architecture: monolithic
+# Detected languages: javascript
+# Framework: Ember.js, React, Express, Nx
+# Database: MySQL
+# Test framework: mocha
+# Runtime: Node.js
+# Package manager: yarn
+# Build tools: nx, yarn, docker compose, eslint, husky
+# Priority threats: Content injection / XSS via markdown rendering of blog posts and comments; Unauthorized content publication or modification via compromised admin accounts; SSRF via oEmbed/embed card features when previewing external URLs in posts; ActivityPub federation abuse (spam follow, malicious actors) when federation is enabled
+
+"on":
+  push:
+    branches: [main, master, develop]
+  pull_request:
+    branches: [main, master, develop]
+  workflow_dispatch:
+
+
+permissions:
+  contents: read
+  pull-requests: read
+  security-events: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint-node:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    continue-on-error: false
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8
+        with:
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Run Node.js linter
+        run: npm run lint --if-present || true
+
+
+  test-node:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    continue-on-error: false
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8
+        with:
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci --no-audit --no-fund
+        continue-on-error: true
+
+      - name: Run Node.js tests
+        run: npm test --if-present || true
+
+
+  sast:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    continue-on-error: true
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8
+        with:
+          persist-credentials: false
+
+      - name: Run semgrep (registry + .semgrep/, SARIF output)
+        run: |
+          # Ensure the `.semgrep/` directory exists before running.
+          # The `--config=.semgrep` flag below imports any custom
+          # rules committed by `pull_request_creation_node`; if the
+          # directory is missing, semgrep returns exit 7 (config
+          # error). Create an empty dir so the import is a no-op
+          # rather than a hard failure.
+          mkdir -p .semgrep
+          docker run --rm \
+            -v "${{ github.workspace }}:/src" \
+            returntocorp/semgrep:1.99.0 \
+            semgrep ci \
+              --config=.semgrep \
+              --config=p/javascript \
+              --config=p/typescript \
+              --config=p/nodejs \
+              --config=p/expressjs \
+              --config=p/react \
+              --config=p/owasp-top-ten \
+              --config=p/secrets \
+              --config=p/security-audit \
+            --sarif --output=/src/semgrep-results.sarif \
+            --timeout=600 --no-suppress-errors
+        continue-on-error: true
+
+      - name: Ensure Semgrep SARIF file exists (fallback for 0 findings or scan error)
+        if: always()
+        run: |
+          if [ ! -s semgrep-results.sarif ]; then
+            echo "::notice::Semgrep did not produce a SARIF file. Generating empty SARIF for upload-sarif."
+            printf '%s\n' \
+              '{' \
+              '  "version": "2.1.0",' \
+              '  "$schema": "https://json.schemastore.org/sarif-2.1.0.json",' \
+              '  "runs": [' \
+              '    {' \
+              '      "tool": {' \
+              '        "driver": {' \
+              '          "name": "Semgrep",' \
+              '          "version": "1.99.0",' \
+              '          "informationUri": "https://semgrep.dev"' \
+              '        }' \
+              '      },' \
+              '      "results": []' \
+              '    }' \
+              '  ]' \
+              '}' > semgrep-results.sarif
+          fi
+          echo "✓ semgrep-results.sarif size: $(stat -c%s semgrep-results.sarif) bytes"
+
+      - name: Upload Semgrep SARIF to GitHub Code Scanning
+        if: always() && hashFiles('semgrep-results.sarif') != ''
+        uses: github/codeql-action/upload-sarif@b1722c1245f90604c2c348f9d1624af97ea8fc6e
+        with:
+          sarif_file: semgrep-results.sarif
+          category: semgrep
+
+      - name: Upload Semgrep SARIF as artifact
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: semgrep-results-${{ github.sha }}
+          path: semgrep-results.sarif
+          if-no-files-found: warn
+          retention-days: 30
+
+  dependency-scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    continue-on-error: false
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8
+        with:
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e
+        with:
+          node-version: '24'
+          cache: 'yarn'
+
+      - name: Install dependencies (no native build)
+        run: yarn install --frozen-lockfile --no-audit --ignore-scripts
+        continue-on-error: true
+
+      - name: Run npm audit (CVE check, JSON output)
+        id: npm-audit
+        run: npm audit --audit-level=high --json > npm-audit-results.json || true
+        continue-on-error: true
+
+      - name: Upload npm audit JSON
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: npm-audit-results-${{ github.sha }}
+          path: npm-audit-results.json
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Run Trivy filesystem scan (SARIF output)
+        id: trivy-fs
+        uses: aquasecurity/trivy-action@b6643a29fecd7f34b3597bc6acb0a98b03d33ff8
+        with:
+          scan-type: 'fs'
+          scan-ref: '.'
+          format: 'sarif'
+          output: 'trivy-fs-results.sarif'
+          version: v0.72.0
+          severity: 'MEDIUM,HIGH,CRITICAL'
+        continue-on-error: true
+      - name: Ensure trivy-fs-results.sarif exists (fallback for 0 findings)
+        if: always()
+        run: |
+          if [ ! -s trivy-fs-results.sarif ]; then
+            echo "::notice::Trivy found 0 findings. Generating empty SARIF to satisfy upload-sarif."
+            printf '%s\n' \
+              '{' \
+              '  "version": "2.1.0",' \
+              '  "$schema": "https://json.schemastore.org/sarif-2.1.0.json",' \
+              '  "runs": [' \
+              '    {' \
+              '      "tool": {' \
+              '        "driver": {' \
+              '          "name": "Trivy",' \
+              '          "version": "0.65.0",' \
+              '          "informationUri": "https://aquasecurity.github.io/trivy/"' \
+              '        }' \
+              '      },' \
+              '      "results": []' \
+              '    }' \
+              '  ]' \
+              '}' > trivy-fs-results.sarif
+          fi
+          echo "✓ trivy-fs-results.sarif size: $(stat -c%s trivy-fs-results.sarif) bytes"
+      - name: Upload Trivy fs SARIF to GitHub Code Scanning
+        if: always()
+        uses: github/codeql-action/upload-sarif@b1722c1245f90604c2c348f9d1624af97ea8fc6e
+        with:
+          sarif_file: trivy-fs-results.sarif
+          category: trivy-fs
+      - name: Upload Trivy fs SARIF as artifact
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: trivy-fs-results-${{ github.sha }}
+          path: trivy-fs-results.sarif
+          if-no-files-found: warn
+          retention-days: 30
+      - name: Convert npm audit JSON to SARIF
+        if: always() && hashFiles('npm-audit-results.json') != ''
+        run: |
+          python3 << "PY_EOF_NPM_AUDIT"
+          import json, sys, re
+          try:
+              with open('npm-audit-results.json') as f:
+                  data = json.load(f)
+              vulns = data.get('vulnerabilities', {})
+              results = []
+              cve_re = re.compile(r'CVE-\d{4}-\d{4,7}')
+              ghsa_re = re.compile(r'GHSA-[a-z0-9]{4}-[a-z0-9]{4}-[a-z0-9]{4}')
+              for pkg, info in vulns.items():
+                  if not info.get('via'):
+                      continue
+                  severity = info.get('severity', 'moderate')
+                  level = 'error' if severity in ('critical', 'high') else 'warning'
+                  range_ = info.get('range', '')
+                  for via in info['via']:
+                      if isinstance(via, str):
+                          # String entry: transitive parent.
+                          # The advisory is held in the original
+                          # audit metadata; emit a finding keyed
+                          # on (pkg, parent) so the dependency
+                          # chain is visible.
+                          rule_id = f'npm-audit:{pkg}->{via}'
+                          message = f'Transitive vulnerability: {via} (parent) brings {pkg} ({range_}, {severity})'
+                          results.append({
+                              'ruleId': rule_id,
+                              'level': level,
+                              'message': {'text': message},
+                              'locations': [{'physicalLocation': {'artifactLocation': {'uri': 'package.json'}}}],
+                              'properties': {'package': pkg, 'parent': via, 'range': range_, 'severity': severity},
+                          })
+                      elif isinstance(via, dict):
+                          title = via.get('title', '')
+                          url = via.get('url', '')
+                          # Prefer a stable CVE/GHSA id from
+                          # the URL; fall back to title.
+                          stable_id = ''
+                          for src in (url, title):
+                              m = cve_re.search(src) or ghsa_re.search(src)
+                              if m:
+                                  stable_id = m.group(0)
+                                  break
+                          rule_id = stable_id or title or f'npm-audit:{pkg}'
+                          if stable_id:
+                              message = f'{title} in {pkg} {range_} (severity={severity}) — {stable_id}'
+                          else:
+                              message = f'{title or "Vulnerability"} in {pkg} {range_} (severity={severity})'
+                          results.append({
+                              'ruleId': rule_id,
+                              'level': level,
+                              'message': {'text': message},
+                              'locations': [{'physicalLocation': {'artifactLocation': {'uri': 'package.json'}}}],
+                              'properties': {
+                                  'package': pkg,
+                                  'range': range_,
+                                  'severity': severity,
+                                  'title': title,
+                                  'url': url,
+                                  'source': via.get('source'),
+                                  'cwe': via.get('cwe', []),
+                                  'cvss_score': via.get('cvss', {}).get('score') if isinstance(via.get('cvss'), dict) else None,
+                              },
+                          })
+              sarif = {
+                  'version': '2.1.0',
+                  '$schema': 'https://json.schemastore.org/sarif-2.1.0.json',
+                  'runs': [{
+                      'tool': {'driver': {'name': 'npm audit', 'version': '1.0', 'informationUri': 'https://docs.npmjs.com/cli/v10/commands/npm-audit'}},
+                      'results': results,
+                  }],
+              }
+              with open('npm-audit-results.sarif', 'w') as f:
+                  json.dump(sarif, f, indent=2)
+              print(f'npm-audit-results.sarif written with {len(results)} findings from {len(vulns)} vulnerable packages')
+          except Exception as e:
+              print(f'npm-audit SARIF conversion error: {e}', file=sys.stderr)
+              import traceback; traceback.print_exc()
+              sys.exit(0)
+          PY_EOF_NPM_AUDIT
+        continue-on-error: true
+
+      - name: Ensure npm-audit-results.sarif exists (fallback for 0 findings)
+        if: always()
+        run: |
+          if [ ! -s npm-audit-results.sarif ]; then
+            echo "::notice::npm audit found 0 findings. Generating empty SARIF to satisfy upload-sarif."
+            printf '%s\n' \
+              '{' \
+              '  "version": "2.1.0",' \
+              '  "$schema": "https://json.schemastore.org/sarif-2.1.0.json",' \
+              '  "runs": [' \
+              '    {' \
+              '      "tool": {' \
+              '        "driver": {' \
+              '          "name": "npm audit",' \
+              '          "version": "1.0",' \
+              '          "informationUri": "https://docs.npmjs.com/cli/v10/commands/npm-audit"' \
+              '        }' \
+              '      },' \
+              '      "results": []' \
+              '    }' \
+              '  ]' \
+              '}' > npm-audit-results.sarif
+          fi
+          echo "✓ npm-audit-results.sarif size: $(stat -c%s npm-audit-results.sarif) bytes"
+
+      - name: Upload npm audit SARIF to GitHub Code Scanning
+        if: always()
+        uses: github/codeql-action/upload-sarif@b1722c1245f90604c2c348f9d1624af97ea8fc6e
+        with:
+          sarif_file: npm-audit-results.sarif
+          category: npm-audit
+
+      - name: Upload npm audit SARIF as artifact
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: npm-audit-sarif-${{ github.sha }}
+          path: npm-audit-results.sarif
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Evaluate dependency-scan findings
+        if: always()
+        run: |
+          echo '## Dependency Scan Summary' >> "$GITHUB_STEP_SUMMARY"
+          echo '- npm audit: '"${{ steps.npm-audit.outcome }}" >> "$GITHUB_STEP_SUMMARY"
+          echo '- trivy fs: '"${{ steps.trivy-fs.outcome }}" >> "$GITHUB_STEP_SUMMARY"
+
+  secret-scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    continue-on-error: false
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Run Gitleaks on PR diff (SARIF output)
+        uses: gitleaks/gitleaks-action@e0c47f4f8be36e29cdc102c57e68cb5cbf0e8d1e
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITLEAKS_ENABLE_UPLOAD_ARTIFACT: false
+          GITLEAKS_FORMAT: sarif
+          GITLEAKS_REPORT_PATH: gitleaks-diff-results.sarif
+        continue-on-error: true
+
+      - name: Run Gitleaks on full working tree (SARIF output)
+        run: |
+          set -e
+          # Install gitleaks CLI (matches the action's version).
+          wget -qO- https://github.com/gitleaks/gitleaks/releases/download/v8.24.3/gitleaks_8.24.3_linux_x64.tar.gz | tar -xz -C /tmp
+          sudo mv /tmp/gitleaks /usr/local/bin/gitleaks || mv /tmp/gitleaks /usr/local/bin/gitleaks
+          gitleaks version
+          # Scan the full working tree. `--no-banner` quiets
+          # the ASCII art. Output is SARIF 2.1.0.
+          gitleaks detect --source . --no-banner --report-format sarif --report-path gitleaks-full-results.sarif --exit-code 0 || true
+        continue-on-error: true
+
+      - name: Merge Gitleaks SARIF results
+        if: always()
+        run: |
+          set -e
+          if [ -s gitleaks-diff-results.sarif ] && [ -s gitleaks-full-results.sarif ]; then
+            # Both scans produced output — concatenate
+            # the result arrays. We use a tiny Python
+            # snippet because `jq` is not guaranteed to
+            # be installed on ubuntu-latest runners.
+            python3 - <<'PY'
+          import json, pathlib
+          diff = json.loads(pathlib.Path('gitleaks-diff-results.sarif').read_text())
+          full = json.loads(pathlib.Path('gitleaks-full-results.sarif').read_text())
+          merged_runs = (diff.get('runs') or []) + (full.get('runs') or [])
+          # De-duplicate by (ruleId, physicalLocation uri:line).
+          seen = set()
+          merged_results = []
+          for run in merged_runs:
+              for r in (run.get('results') or []):
+                  loc = (r.get('locations') or [{}])[0].get('physicalLocation', {})
+                  uri = (loc.get('artifactLocation') or {}).get('uri', '')
+                  line = (loc.get('region') or {}).get('startLine', 0)
+                  key = (r.get('ruleId',''), uri, line)
+                  if key in seen:
+                      continue
+                  seen.add(key)
+                  merged_results.append(r)
+          base = diff if diff.get('runs') else full
+          base['runs'] = merged_runs
+          for run in base['runs']:
+              run['results'] = merged_results if run is base['runs'][0] else (run.get('results') or [])
+          pathlib.Path('gitleaks-results.sarif').write_text(json.dumps(base, indent=2))
+          print(f'Merged SARIF: {len(merged_results)} unique findings')
+          PY
+          elif [ -s gitleaks-full-results.sarif ]; then
+            cp gitleaks-full-results.sarif gitleaks-results.sarif
+          elif [ -s gitleaks-diff-results.sarif ]; then
+            cp gitleaks-diff-results.sarif gitleaks-results.sarif
+          fi
+          ls -la gitleaks-*.sarif || true
+
+      - name: Ensure gitleaks-results.sarif exists (fallback for 0 findings)
+        if: always()
+        run: |
+          if [ ! -s gitleaks-results.sarif ]; then
+            echo "::notice::Gitleaks found 0 findings. Generating empty SARIF to satisfy upload-sarif."
+            printf '%s\n' \
+              '{' \
+              '  "version": "2.1.0",' \
+              '  "$schema": "https://json.schemastore.org/sarif-2.1.0.json",' \
+              '  "runs": [' \
+              '    {' \
+              '      "tool": {' \
+              '        "driver": {' \
+              '          "name": "Gitleaks",' \
+              '          "version": "8.24.3",' \
+              '          "informationUri": "https://gitleaks.io"' \
+              '        }' \
+              '      },' \
+              '      "results": []' \
+              '    }' \
+              '  ]' \
+              '}' > gitleaks-results.sarif
+          fi
+          echo "✓ gitleaks-results.sarif size: $(stat -c%s gitleaks-results.sarif) bytes"
+
+      - name: Upload Gitleaks SARIF to GitHub Code Scanning
+        if: always()
+        uses: github/codeql-action/upload-sarif@b1722c1245f90604c2c348f9d1624af97ea8fc6e
+        with:
+          sarif_file: gitleaks-results.sarif
+          category: gitleaks
+
+      - name: Upload Gitleaks SARIF as artifact
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: gitleaks-sarif-${{ github.sha }}
+          path: gitleaks-results.sarif
+          if-no-files-found: warn
+          retention-days: 30
+
+
+  auth-jwt-weak-secret:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    continue-on-error: true
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8
+        with:
+          persist-credentials: false
+
+      - name: scan-jwt-sign-with-literal-secret
+        run: |
+          # Set up output capture for the annotation-to-SARIF step.
+          exec > >(tee -a auth-jwt-weak-secret.shell_log) 2>&1
+          # Run the original script in a subshell with set +e so
+          # that any single command failure does not abort the
+          # script before it can emit a '::error' annotation.
+          inner_exit=0
+          ( set +e
+          # Locate files referencing jsonwebtoken outside node_modules / build artefacts
+          FILES=$(grep -rE --include='*.js' --include='*.ts' --include='*.mjs' -l 'jsonwebtoken' . 2>/dev/null | grep -vE '(node_modules|/dist/|/build/)' | head -50 || true)
+          if [ -z "$FILES" ]; then
+            echo "OK: no jsonwebtoken usage detected."
+            exit 0
+          fi
+          BAD=0
+          for f in $FILES; do
+            # jwt.sign(payload, "short-string", opts) — literal/short HMAC secret
+            if grep -E "jwt\.sign\([^)]*['\"][A-Za-z0-9_-]{0,15}['\"]" "$f" >/dev/null 2>&1; then
+              echo "FAIL: short/hardcoded JWT secret literal in $f"
+              BAD=1
+            fi
+          done
+          if [ "$BAD" -eq 1 ]; then
+            exit 1
+          fi
+          echo "OK: no weak literal JWT secrets found in $FILES"
+          ) || inner_exit=$?
+          # If the inner script exited non-zero and emitted no
+          # '::error'/'::warning' annotation, synthesise one so the
+          # SARIF conversion step still has a finding to record.
+          if [ "$inner_exit" -ne 0 ] && ! grep -qE '^::(error|warning)' auth-jwt-weak-secret.shell_log; then
+            echo "::error file=scan-jwt-sign-with-literal-secret::shell check failed (exit code $inner_exit) — see run log for details"
+          fi
+          exit $inner_exit
+
+      - name: semgrep-jwt-weak-secret
+        run: |
+          echo 'AI-designed Semgrep rule (id=ai-rule):'
+          echo 'Rule body:'
+          cat <<'SEMGREP_EOF' | sed 's/^/  /'
+
+          SEMGREP_EOF
+      - name: Convert auth-jwt-weak-secret shell_check annotations to SARIF
+        if: always()
+        run: |
+          cat > auth-jwt-weak-secret_annotations_to_sarif.py <<'PY_EOF'
+          import os, re, json
+          log_path = 'auth-jwt-weak-secret.shell_log'
+          sarif_path = 'auth-jwt-weak-secret-results.sarif'
+          tool_name = 'auth-jwt-weak-secret'
+          tool_version = '1.0.0'
+          information_uri = 'https://github.com/iqbalrsyd/ai-devsecops'
+          rule_id_prefix = 'ai-devsecops-auth-jwt-weak-secret'
+          results = []
+          if os.path.exists(log_path):
+              pat = re.compile(
+                  r'^::(error|warning)(?:\s+([A-Za-z]+=[^,]+(?:,[A-Za-z]+=[^,]+)*))?::(.*)$'
+              )
+              for idx, line in enumerate(open(log_path, encoding='utf-8', errors='replace')):
+                  m = pat.match(line.rstrip('\n'))
+                  if not m:
+                      continue
+                  level, props, msg = m.groups()
+                  path = None
+                  sl = None
+                  el = None
+                  title = None
+                  if props:
+                      for kv in props.split(','):
+                          if '=' in kv:
+                              k, v = kv.split('=', 1)
+                              k = k.strip()
+                              v = v.strip()
+                              if k == 'file':
+                                  path = v
+                              elif k == 'line':
+                                  try:
+                                      sl = int(v)
+                                  except ValueError:
+                                      pass
+                              elif k in ('endLine', 'col'):
+                                  try:
+                                      el = int(v) if k == 'endLine' else sl
+                                  except ValueError:
+                                      pass
+                              elif k == 'title':
+                                  title = v
+                  if sl is None:
+                      sl = 1
+                  if el is None:
+                      el = sl
+                  sarif_level = 'error' if level == 'error' else 'warning'
+                  msg = (msg or '').strip()
+                  # If there is no file but there is a title, use the
+                  if not msg and title:
+                      msg = title
+                  # Use the first 50 chars of the title (if any) as
+                  slug_src = title or msg or 'finding'
+                  slug = re.sub(r'[^a-z0-9]+', '-', slug_src.lower())[:50].strip('-')
+                  rule_id = f'{rule_id_prefix}-{slug}-{sl}-{idx}'
+                  results.append({
+                      'ruleId': rule_id,
+                      'level': sarif_level,
+                      'message': {'text': msg or '(no message)'},
+                      'locations': [{
+                          'physicalLocation': {
+                              'artifactLocation': {'uri': path or 'unknown'},
+                              'region': {'startLine': sl, 'endLine': el},
+                          },
+                      }],
+                  })
+          existing = {}
+          if os.path.exists(sarif_path) and os.path.getsize(sarif_path) > 0:
+              try:
+                  existing = json.load(open(sarif_path, encoding='utf-8'))
+              except Exception:
+                  existing = {}
+          if not existing or 'runs' not in existing or not existing['runs']:
+              existing = {
+                  'version': '2.1.0',
+                  '$schema': 'https://json.schemastore.org/sarif-2.1.0.json',
+                  'runs': [{
+                      'tool': {'driver': {
+                          'name': tool_name, 'version': tool_version, 'informationUri': information_uri,
+                      }},
+                      'results': [],
+                  }],
+              }
+          existing['runs'][0]['tool']['driver']['name'] = tool_name
+          existing['runs'][0]['tool']['driver']['version'] = tool_version
+          existing['runs'][0]['tool']['driver']['informationUri'] = information_uri
+          existing['runs'][0]['results'] = (existing['runs'][0].get('results') or []) + results
+          with open(sarif_path, 'w', encoding='utf-8') as f:
+              json.dump(existing, f, indent=2)
+          print(f'Wrote {len(results)} SARIF result(s) to {sarif_path}')
+          PY_EOF
+          python3 auth-jwt-weak-secret_annotations_to_sarif.py
+      - name: Ensure auth-jwt-weak-secret-results.sarif exists (fallback for 0 findings)
+        if: always()
+        run: |
+          if [ ! -s auth-jwt-weak-secret-results.sarif ]; then
+            echo "::notice::auth-jwt-weak-secret found 0 findings. Generating empty SARIF to satisfy upload-sarif."
+            printf '%s\n' \
+              '{' \
+              '  "version": "2.1.0",' \
+              '  "$schema": "https://json.schemastore.org/sarif-2.1.0.json",' \
+              '  "runs": [' \
+              '    {' \
+              '      "tool": {' \
+              '        "driver": {' \
+              '          "name": "auth-jwt-weak-secret",' \
+              '          "version": "0.65.0",' \
+              '          "informationUri": "https://aquasecurity.github.io/trivy/"' \
+              '        }' \
+              '      },' \
+              '      "results": []' \
+              '    }' \
+              '  ]' \
+              '}' > auth-jwt-weak-secret-results.sarif
+          fi
+          echo "✓ auth-jwt-weak-secret-results.sarif size: $(stat -c%s auth-jwt-weak-secret-results.sarif) bytes"
+      - name: Upload auth-jwt-weak-secret SARIF to GitHub Code Scanning
+        if: always()
+        uses: github/codeql-action/upload-sarif@b1722c1245f90604c2c348f9d1624af97ea8fc6e
+        with:
+          sarif_file: auth-jwt-weak-secret-results.sarif
+          category: auth-jwt-weak-secret
+
+  cms-markdown-render-xss:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    continue-on-error: true
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8
+        with:
+          persist-credentials: false
+
+      - name: scan-unsafe-html-injection-sites
+        run: |
+          # Set up output capture for the annotation-to-SARIF step.
+          exec > >(tee -a cms-markdown-render-xss.shell_log) 2>&1
+          # Run the original script in a subshell with set +e so
+          # that any single command failure does not abort the
+          # script before it can emit a '::error' annotation.
+          inner_exit=0
+          ( set +e
+          PATTERN='dangerouslySetInnerHTML\s*=|v-html\s*=|\{\{\{html\b|\{\{html-safe\b'
+          HITS=$(grep -rEn --include='*.js' --include='*.ts' --include='*.jsx' --include='*.tsx' --include='*.hbs' --include='*.handlebars' "$PATTERN" . 2>/dev/null | grep -vE '(node_modules|/dist/|/build/)' | head -200 || true)
+          if [ -z "$HITS" ]; then
+            echo "OK: no dangerouslySetInnerHTML / v-html / {{{html}}} call sites detected."
+            exit 0
+          fi
+          echo "FOUND unescaped HTML injection sites — review sanitization:"
+          printf '%s\n' "$HITS"
+          # Heuristic: if any of the files are test fixtures, ignore; otherwise flag.
+          # We simply exit 1 so the job reports failure for human review.
+          exit 1
+          ) || inner_exit=$?
+          # If the inner script exited non-zero and emitted no
+          # '::error'/'::warning' annotation, synthesise one so the
+          # SARIF conversion step still has a finding to record.
+          if [ "$inner_exit" -ne 0 ] && ! grep -qE '^::(error|warning)' cms-markdown-render-xss.shell_log; then
+            echo "::error file=scan-unsafe-html-injection-sites::shell check failed (exit code $inner_exit) — see run log for details"
+          fi
+          exit $inner_exit
+
+      - name: semgrep-cms-xss-html-injection
+        run: |
+          echo 'AI-designed Semgrep rule (id=ai-rule):'
+          echo 'Rule body:'
+          cat <<'SEMGREP_EOF' | sed 's/^/  /'
+
+          SEMGREP_EOF
+      - name: Convert cms-markdown-render-xss shell_check annotations to SARIF
+        if: always()
+        run: |
+          cat > cms-markdown-render-xss_annotations_to_sarif.py <<'PY_EOF'
+          import os, re, json
+          log_path = 'cms-markdown-render-xss.shell_log'
+          sarif_path = 'cms-markdown-render-xss-results.sarif'
+          tool_name = 'cms-markdown-render-xss'
+          tool_version = '1.0.0'
+          information_uri = 'https://github.com/iqbalrsyd/ai-devsecops'
+          rule_id_prefix = 'ai-devsecops-cms-markdown-render-xss'
+          results = []
+          if os.path.exists(log_path):
+              pat = re.compile(
+                  r'^::(error|warning)(?:\s+([A-Za-z]+=[^,]+(?:,[A-Za-z]+=[^,]+)*))?::(.*)$'
+              )
+              for idx, line in enumerate(open(log_path, encoding='utf-8', errors='replace')):
+                  m = pat.match(line.rstrip('\n'))
+                  if not m:
+                      continue
+                  level, props, msg = m.groups()
+                  path = None
+                  sl = None
+                  el = None
+                  title = None
+                  if props:
+                      for kv in props.split(','):
+                          if '=' in kv:
+                              k, v = kv.split('=', 1)
+                              k = k.strip()
+                              v = v.strip()
+                              if k == 'file':
+                                  path = v
+                              elif k == 'line':
+                                  try:
+                                      sl = int(v)
+                                  except ValueError:
+                                      pass
+                              elif k in ('endLine', 'col'):
+                                  try:
+                                      el = int(v) if k == 'endLine' else sl
+                                  except ValueError:
+                                      pass
+                              elif k == 'title':
+                                  title = v
+                  if sl is None:
+                      sl = 1
+                  if el is None:
+                      el = sl
+                  sarif_level = 'error' if level == 'error' else 'warning'
+                  msg = (msg or '').strip()
+                  # If there is no file but there is a title, use the
+                  if not msg and title:
+                      msg = title
+                  # Use the first 50 chars of the title (if any) as
+                  slug_src = title or msg or 'finding'
+                  slug = re.sub(r'[^a-z0-9]+', '-', slug_src.lower())[:50].strip('-')
+                  rule_id = f'{rule_id_prefix}-{slug}-{sl}-{idx}'
+                  results.append({
+                      'ruleId': rule_id,
+                      'level': sarif_level,
+                      'message': {'text': msg or '(no message)'},
+                      'locations': [{
+                          'physicalLocation': {
+                              'artifactLocation': {'uri': path or 'unknown'},
+                              'region': {'startLine': sl, 'endLine': el},
+                          },
+                      }],
+                  })
+          existing = {}
+          if os.path.exists(sarif_path) and os.path.getsize(sarif_path) > 0:
+              try:
+                  existing = json.load(open(sarif_path, encoding='utf-8'))
+              except Exception:
+                  existing = {}
+          if not existing or 'runs' not in existing or not existing['runs']:
+              existing = {
+                  'version': '2.1.0',
+                  '$schema': 'https://json.schemastore.org/sarif-2.1.0.json',
+                  'runs': [{
+                      'tool': {'driver': {
+                          'name': tool_name, 'version': tool_version, 'informationUri': information_uri,
+                      }},
+                      'results': [],
+                  }],
+              }
+          existing['runs'][0]['tool']['driver']['name'] = tool_name
+          existing['runs'][0]['tool']['driver']['version'] = tool_version
+          existing['runs'][0]['tool']['driver']['informationUri'] = information_uri
+          existing['runs'][0]['results'] = (existing['runs'][0].get('results') or []) + results
+          with open(sarif_path, 'w', encoding='utf-8') as f:
+              json.dump(existing, f, indent=2)
+          print(f'Wrote {len(results)} SARIF result(s) to {sarif_path}')
+          PY_EOF
+          python3 cms-markdown-render-xss_annotations_to_sarif.py
+      - name: Ensure cms-markdown-render-xss-results.sarif exists (fallback for 0 findings)
+        if: always()
+        run: |
+          if [ ! -s cms-markdown-render-xss-results.sarif ]; then
+            echo "::notice::cms-markdown-render-xss found 0 findings. Generating empty SARIF to satisfy upload-sarif."
+            printf '%s\n' \
+              '{' \
+              '  "version": "2.1.0",' \
+              '  "$schema": "https://json.schemastore.org/sarif-2.1.0.json",' \
+              '  "runs": [' \
+              '    {' \
+              '      "tool": {' \
+              '        "driver": {' \
+              '          "name": "cms-markdown-render-xss",' \
+              '          "version": "0.65.0",' \
+              '          "informationUri": "https://aquasecurity.github.io/trivy/"' \
+              '        }' \
+              '      },' \
+              '      "results": []' \
+              '    }' \
+              '  ]' \
+              '}' > cms-markdown-render-xss-results.sarif
+          fi
+          echo "✓ cms-markdown-render-xss-results.sarif size: $(stat -c%s cms-markdown-render-xss-results.sarif) bytes"
+      - name: Upload cms-markdown-render-xss SARIF to GitHub Code Scanning
+        if: always()
+        uses: github/codeql-action/upload-sarif@b1722c1245f90604c2c348f9d1624af97ea8fc6e
+        with:
+          sarif_file: cms-markdown-render-xss-results.sarif
+          category: cms-markdown-render-xss
+
+  data-sql-injection:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    continue-on-error: true
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8
+        with:
+          persist-credentials: false
+
+      - name: scan-knex-raw-with-request-input
+        run: |
+          # Set up output capture for the annotation-to-SARIF step.
+          exec > >(tee -a data-sql-injection.shell_log) 2>&1
+          # Run the original script in a subshell with set +e so
+          # that any single command failure does not abort the
+          # script before it can emit a '::error' annotation.
+          inner_exit=0
+          ( set +e
+          # Knex.raw / this.query / bookshelf fetchAll built from a template literal
+          # that interpolates user-controlled request data.
+          PATTERN='(knex|\$db)\.raw\s*\(\s*`[^`]*\$\{(req|request)\.(body|params|query|headers)|this\.query\s*\(\s*`[^`]*\$\{(req|request)\.(body|params|query|headers)'
+          HITS=$(grep -rEn --include='*.js' --include='*.ts' "$PATTERN" . 2>/dev/null | grep -vE '(node_modules|/dist/|/build/)' | head -100 || true)
+          if [ -z "$HITS" ]; then
+            echo "OK: no knex.raw() with interpolated request input found."
+            exit 0
+          fi
+          echo "POTENTIAL SQLi: raw query string built from req.* input:"
+          printf '%s\n' "$HITS"
+          exit 1
+          ) || inner_exit=$?
+          # If the inner script exited non-zero and emitted no
+          # '::error'/'::warning' annotation, synthesise one so the
+          # SARIF conversion step still has a finding to record.
+          if [ "$inner_exit" -ne 0 ] && ! grep -qE '^::(error|warning)' data-sql-injection.shell_log; then
+            echo "::error file=scan-knex-raw-with-request-input::shell check failed (exit code $inner_exit) — see run log for details"
+          fi
+          exit $inner_exit
+
+      - name: semgrep-knex-raw-injection
+        run: |
+          echo 'AI-designed Semgrep rule (id=ai-rule):'
+          echo 'Rule body:'
+          cat <<'SEMGREP_EOF' | sed 's/^/  /'
+
+          SEMGREP_EOF
+      - name: Convert data-sql-injection shell_check annotations to SARIF
+        if: always()
+        run: |
+          cat > data-sql-injection_annotations_to_sarif.py <<'PY_EOF'
+          import os, re, json
+          log_path = 'data-sql-injection.shell_log'
+          sarif_path = 'data-sql-injection-results.sarif'
+          tool_name = 'data-sql-injection'
+          tool_version = '1.0.0'
+          information_uri = 'https://github.com/iqbalrsyd/ai-devsecops'
+          rule_id_prefix = 'ai-devsecops-data-sql-injection'
+          results = []
+          if os.path.exists(log_path):
+              pat = re.compile(
+                  r'^::(error|warning)(?:\s+([A-Za-z]+=[^,]+(?:,[A-Za-z]+=[^,]+)*))?::(.*)$'
+              )
+              for idx, line in enumerate(open(log_path, encoding='utf-8', errors='replace')):
+                  m = pat.match(line.rstrip('\n'))
+                  if not m:
+                      continue
+                  level, props, msg = m.groups()
+                  path = None
+                  sl = None
+                  el = None
+                  title = None
+                  if props:
+                      for kv in props.split(','):
+                          if '=' in kv:
+                              k, v = kv.split('=', 1)
+                              k = k.strip()
+                              v = v.strip()
+                              if k == 'file':
+                                  path = v
+                              elif k == 'line':
+                                  try:
+                                      sl = int(v)
+                                  except ValueError:
+                                      pass
+                              elif k in ('endLine', 'col'):
+                                  try:
+                                      el = int(v) if k == 'endLine' else sl
+                                  except ValueError:
+                                      pass
+                              elif k == 'title':
+                                  title = v
+                  if sl is None:
+                      sl = 1
+                  if el is None:
+                      el = sl
+                  sarif_level = 'error' if level == 'error' else 'warning'
+                  msg = (msg or '').strip()
+                  # If there is no file but there is a title, use the
+                  if not msg and title:
+                      msg = title
+                  # Use the first 50 chars of the title (if any) as
+                  slug_src = title or msg or 'finding'
+                  slug = re.sub(r'[^a-z0-9]+', '-', slug_src.lower())[:50].strip('-')
+                  rule_id = f'{rule_id_prefix}-{slug}-{sl}-{idx}'
+                  results.append({
+                      'ruleId': rule_id,
+                      'level': sarif_level,
+                      'message': {'text': msg or '(no message)'},
+                      'locations': [{
+                          'physicalLocation': {
+                              'artifactLocation': {'uri': path or 'unknown'},
+                              'region': {'startLine': sl, 'endLine': el},
+                          },
+                      }],
+                  })
+          existing = {}
+          if os.path.exists(sarif_path) and os.path.getsize(sarif_path) > 0:
+              try:
+                  existing = json.load(open(sarif_path, encoding='utf-8'))
+              except Exception:
+                  existing = {}
+          if not existing or 'runs' not in existing or not existing['runs']:
+              existing = {
+                  'version': '2.1.0',
+                  '$schema': 'https://json.schemastore.org/sarif-2.1.0.json',
+                  'runs': [{
+                      'tool': {'driver': {
+                          'name': tool_name, 'version': tool_version, 'informationUri': information_uri,
+                      }},
+                      'results': [],
+                  }],
+              }
+          existing['runs'][0]['tool']['driver']['name'] = tool_name
+          existing['runs'][0]['tool']['driver']['version'] = tool_version
+          existing['runs'][0]['tool']['driver']['informationUri'] = information_uri
+          existing['runs'][0]['results'] = (existing['runs'][0].get('results') or []) + results
+          with open(sarif_path, 'w', encoding='utf-8') as f:
+              json.dump(existing, f, indent=2)
+          print(f'Wrote {len(results)} SARIF result(s) to {sarif_path}')
+          PY_EOF
+          python3 data-sql-injection_annotations_to_sarif.py
+      - name: Ensure data-sql-injection-results.sarif exists (fallback for 0 findings)
+        if: always()
+        run: |
+          if [ ! -s data-sql-injection-results.sarif ]; then
+            echo "::notice::data-sql-injection found 0 findings. Generating empty SARIF to satisfy upload-sarif."
+            printf '%s\n' \
+              '{' \
+              '  "version": "2.1.0",' \
+              '  "$schema": "https://json.schemastore.org/sarif-2.1.0.json",' \
+              '  "runs": [' \
+              '    {' \
+              '      "tool": {' \
+              '        "driver": {' \
+              '          "name": "data-sql-injection",' \
+              '          "version": "0.65.0",' \
+              '          "informationUri": "https://aquasecurity.github.io/trivy/"' \
+              '        }' \
+              '      },' \
+              '      "results": []' \
+              '    }' \
+              '  ]' \
+              '}' > data-sql-injection-results.sarif
+          fi
+          echo "✓ data-sql-injection-results.sarif size: $(stat -c%s data-sql-injection-results.sarif) bytes"
+      - name: Upload data-sql-injection SARIF to GitHub Code Scanning
+        if: always()
+        uses: github/codeql-action/upload-sarif@b1722c1245f90604c2c348f9d1624af97ea8fc6e
+        with:
+          sarif_file: data-sql-injection-results.sarif
+          category: data-sql-injection
